@@ -1,0 +1,9 @@
+# Tailscale enrollment secrets and device identity
+*authkey*
+*auth-key*
+*.key
+*.state
+*.env
+.env*
+installer-backups/
+backup-*/
