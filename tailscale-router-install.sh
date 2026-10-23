@@ -1,44 +1,25 @@
 #!/bin/sh
-# OpenWrt: persistent Tailscale userspace installation with browser login.
-# Optional: SOCKS5_LISTEN=0.0.0.0:1055 sh tailscale-router-install.sh
-# Empty SOCKS5_LISTEN disables the proxy. Default: localhost only.
+# Tailscale from GuNanOvO/openwrt-tailscale, persistent package installation.
+# Based on the user's original userspace configuration. Run through local SSH.
 set -eu
 umask 077
-
-SOCKS5_LISTEN=${SOCKS5_LISTEN-127.0.0.1:1055}
 unset TS_AUTHKEY TS_AUTH_KEY TS_AUTHKEY_FILE
-[ "$#" -eq 0 ] || { printf '%s\n' 'Usage: sh tailscale-router-install.sh' >&2; exit 1; }
-INIT=/etc/init.d/tailscale
-CONFIG=/etc/config/tailscale
-HOOK=/etc/hotplug.d/iface/95-tailscale
-LOCK=/tmp/tailscale-router-install.lock
-BACKUP=
-CHANGED=0
-COMMITTED=0
 
 say() { printf '%s\n' "$*"; }
 die() { say "ERROR: $*" >&2; exit 1; }
-
 [ "$(id -u)" = 0 ] || die 'Run as root.'
-[ -f /etc/openwrt_release ] || die 'This script requires OpenWrt.'
-for cmd in uci jsonfilter awk mktemp pidof; do
+[ -f /etc/openwrt_release ] || die 'OpenWrt is required.'
+[ "$#" -eq 0 ] || die 'This installer takes no arguments.'
+for cmd in wget awk jsonfilter mktemp pidof; do
     command -v "$cmd" >/dev/null 2>&1 || die "Missing command: $cmd"
 done
-case "$SOCKS5_LISTEN" in
-    *[!a-zA-Z0-9.:\[\]-]*) die 'Invalid SOCKS5_LISTEN address.' ;;
-esac
-mkdir "$LOCK" 2>/dev/null || die "Another installation is running (lock: $LOCK)."
-
+INIT=/etc/init.d/tailscale
+LOCK=/tmp/tailscale-router-mini.lock
+mkdir "$LOCK" 2>/dev/null || die "Installer is already running (lock: $LOCK)."
 cleanup() {
     rc=$?
     trap - EXIT HUP INT TERM
-    if [ "$rc" -ne 0 ] && [ "$CHANGED" = 1 ] && [ "$COMMITTED" = 0 ]; then
-        say 'Configuration failed; restoring backed-up files.' >&2
-        if ! sh "$BACKUP/rollback.sh"; then
-            say "ERROR: rollback failed. Use local access and inspect $BACKUP" >&2
-        fi
-    fi
-    rm -f "$LOCK/init.new" "$LOCK/status.json"
+    rm -f "$LOCK/vendor.sh" "$LOCK/init.new" "$LOCK/status.json"
     rmdir "$LOCK" 2>/dev/null || :
     exit "$rc"
 }
@@ -47,141 +28,76 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-say '[1/6] Checking/installing package...'
-if ! command -v tailscale >/dev/null 2>&1 || ! command -v tailscaled >/dev/null 2>&1; then
-    if command -v apk >/dev/null 2>&1; then
-        apk update
-        apk add tailscale
-    elif command -v opkg >/dev/null 2>&1; then
-        opkg update
-        opkg install tailscale
-    else
-        die 'Neither apk nor opkg is available.'
+say '[1/6] Installing Tailscale mini from GuNanOvO (persistent mode)...'
+# Save existing files before the upstream installer can replace them.
+mkdir -p /etc/tailscale
+BACKUP=$(mktemp -d /etc/tailscale/mini-backup-XXXXXX)
+for file in /etc/config/tailscale /etc/init.d/tailscale /etc/hotplug.d/iface/95-tailscale; do
+    if [ -f "$file" ]; then
+        case "$file" in
+            /etc/config/*) cp -p "$file" "$BACKUP/config" ;;
+            /etc/init.d/*) cp -p "$file" "$BACKUP/init" ;;
+            *) cp -p "$file" "$BACKUP/hotplug" ;;
+        esac
     fi
-fi
-[ -f "$INIT" ] || die 'The package did not provide /etc/init.d/tailscale.'
-# Keep this export unambiguous for both the daemon and its cleanup command.
-grep -q 'USE_PROCD=1' "$INIT" || die 'Unsupported init script: procd is required.'
+done
+say "Configuration backup: $BACKUP"
+wget -T 30 -O "$LOCK/vendor.sh" \
+    'https://raw.githubusercontent.com/GuNanOvO/openwrt-tailscale/main/install_en.sh'
+[ -s "$LOCK/vendor.sh" ] || die 'Downloaded upstream installer is empty.'
+sh -n "$LOCK/vendor.sh" || die 'Downloaded upstream installer has invalid shell syntax.'
+cp "$LOCK/vendor.sh" /usr/sbin/install.sh
+chmod 755 /usr/sbin/install.sh
+/usr/sbin/install.sh --persistent-install --yes
+command -v tailscale >/dev/null 2>&1 || die 'Upstream installer did not provide tailscale.'
+command -v tailscaled >/dev/null 2>&1 || die 'Upstream installer did not provide tailscaled.'
+[ -f "$INIT" ] || die 'Upstream installer did not provide a service.'
 
-say '[2/6] Validating service configuration...'
-# Remove only recognised arguments, including arguments from the old installer.
-# Unknown TUN/proxy/log arguments cause an error instead of a speculative edit.
-prepare_init() {
-awk -v socks="$SOCKS5_LISTEN" '
-    /^[ \t]*# BEGIN tailscale-router-installer$/ { next }
-    /^[ \t]*# END tailscale-router-installer$/ { next }
-    /^[ \t]*export TS_NO_LOGS_NO_SUPPORT=true$/ { next }
+say '[2/6] Applying the original userspace service settings...'
+# Same three daemon flags as the original; replace recognised old flags once.
+awk '
     /^[ \t]*procd_append_param command --no-logs-no-support[ \t]*$/ { next }
     /^[ \t]*procd_append_param command --tun=userspace-networking[ \t]*$/ { next }
     /^[ \t]*procd_append_param command --socks5-server=[a-zA-Z0-9.:\[\]-]+[ \t]*$/ { next }
     /--tun|--socks5-server|--no-logs-no-support/ { bad=1 }
     { print }
-    /^USE_PROCD=1$/ { print "export TS_NO_LOGS_NO_SUPPORT=true" }
     /^[ \t]*procd_append_param command --state "\$state_file"[ \t]*$/ {
         anchors++
-        print "  # BEGIN tailscale-router-installer"
         print "  procd_append_param command --no-logs-no-support"
         print "  procd_append_param command --tun=userspace-networking"
-        if (socks != "") print "  procd_append_param command --socks5-server=" socks
-        print "  # END tailscale-router-installer"
+        print "  procd_append_param command --socks5-server=0.0.0.0:1055"
     }
     END { if (anchors != 1 || bad) exit 1 }
-' "$INIT" > "$LOCK/init.new" || die 'Unsupported init script format.'
-sh -n "$LOCK/init.new" || die 'Generated init script has invalid syntax.'
-}
-prepare_init
-
-# Only remove the known hook from the original installer.
-if [ -e "$HOOK" ]; then
-    grep -q 'logger -t tailscale-hotplug' "$HOOK" &&
-    grep -q '/etc/init.d/tailscale restart' "$HOOK" ||
-        die "Unrecognised $HOOK; review it before installing."
-fi
-if [ -n "$(uci -q changes tailscale || :)" ]; then
-    die 'Uncommitted Tailscale UCI changes exist; commit or revert them first.'
-fi
-
-say '[3/6] Saving private backup and rollback command...'
-mkdir -p /etc/tailscale/installer-backups
-chmod 700 /etc/tailscale/installer-backups
-BACKUP=$(mktemp -d /etc/tailscale/installer-backups/backup-XXXXXX)
-cp -p "$INIT" "$BACKUP/init"
-if [ -e "$CONFIG" ]; then cp -p "$CONFIG" "$BACKUP/config"; fi
-if [ -e "$HOOK" ]; then cp -p "$HOOK" "$BACKUP/hook"; fi
-if "$INIT" enabled >/dev/null 2>&1; then touch "$BACKUP/was-enabled"; fi
-if pidof tailscaled >/dev/null 2>&1; then touch "$BACKUP/was-running"; fi
-# Preserve the identity for manual recovery only; rollback must not replace live keys.
-state_file=$(uci -q get tailscale.settings.state_file || :)
-state_file=${state_file:-/etc/tailscale/tailscaled.state}
-case "$state_file" in
-    /*) if [ -f "$state_file" ]; then cp -p "$state_file" "$BACKUP/identity.state"; fi ;;
-    *) die 'The configured state_file must be an absolute path.' ;;
-esac
-cat > "$BACKUP/rollback.sh" <<'ROLLBACK'
-#!/bin/sh
-set -eu
-cd "$(dirname "$0")"
-/etc/init.d/tailscale stop || :
-uci -q revert tailscale || :
-cp -p init /etc/init.d/tailscale
-if [ -f config ]; then cp -p config /etc/config/tailscale; else rm -f /etc/config/tailscale; fi
-if [ -f hook ]; then
-    mkdir -p /etc/hotplug.d/iface
-    cp -p hook /etc/hotplug.d/iface/95-tailscale
-else
-    rm -f /etc/hotplug.d/iface/95-tailscale
-fi
-if [ -f was-enabled ]; then /etc/init.d/tailscale enable; else /etc/init.d/tailscale disable; fi
-if [ -f was-running ]; then /etc/init.d/tailscale start; fi
-printf '%s\n' 'Previous configuration restored. Package and identity were retained.'
-ROLLBACK
-chmod 700 "$BACKUP/rollback.sh"
-say "Backup: $BACKUP"
-say "Rollback: sh $BACKUP/rollback.sh"
-
-say '[4/6] Applying userspace configuration...'
-CHANGED=1
-# Modify only our options; retain other UCI settings and the existing state path.
-touch "$CONFIG"
-uci set tailscale.settings=settings
-uci set "tailscale.settings.state_file=$state_file"
-uci set tailscale.settings.log_stdout=0
-uci set tailscale.settings.log_stderr=1
-if ! uci -q get tailscale.settings.port >/dev/null; then
-    uci set tailscale.settings.port=41641
-fi
-uci commit tailscale
-mkdir -p "$(dirname "$state_file")"
+' "$INIT" > "$LOCK/init.new" || die 'Unsupported upstream init format; custom settings were not applied.'
+sh -n "$LOCK/init.new"
+cat > /etc/config/tailscale <<'CONFIG'
+config settings 'settings'
+  option log_stdout '0'
+  option log_stderr '0'
+  option port '41641'
+  option state_file '/etc/tailscale/tailscaled.state'
+  option fw_mode 'none'
+CONFIG
 cp "$LOCK/init.new" "$INIT"
 chmod 755 "$INIT"
+
+say '[3/6] Installing WAN/WAN6 restart hook...'
 mkdir -p /etc/hotplug.d/iface
-cat > "$HOOK" <<'HOTPLUG'
+cat > /etc/hotplug.d/iface/95-tailscale <<'HOTPLUG'
 #!/bin/sh
-# Deliberate recovery workaround: restart on every WAN/WAN6 ifup.
-[ "$ACTION" = ifup ] || exit 0
-case "$INTERFACE" in wan|wan6) ;; *) exit 0 ;; esac
-# The installer itself restarts Tailscale after applying its configuration.
-[ ! -d /tmp/tailscale-router-install.lock ] || exit 0
-# Coalesce WAN and WAN6 events without blocking the hotplug dispatcher.
-mkdir /tmp/tailscale-wan-restart.lock 2>/dev/null || exit 0
-(
-    trap 'rmdir /tmp/tailscale-wan-restart.lock 2>/dev/null || :' EXIT
-    trap 'exit 1' HUP INT TERM
-    sleep 5
-    if [ ! -d /tmp/tailscale-router-install.lock ]; then
-        logger -t tailscale-hotplug "WAN interface $INTERFACE up; restarting Tailscale after delay"
-        if ! /etc/init.d/tailscale restart; then
-            logger -t tailscale-hotplug 'ERROR: Tailscale restart failed'
-        fi
-    fi
-) </dev/null >/dev/null 2>&1 &
-exit 0
+if [ "$ACTION" = "ifup" ] && {
+    [ "$INTERFACE" = "wan" ] || [ "$INTERFACE" = "wan6" ];
+}; then
+    logger -t tailscale-hotplug "WAN interface $INTERFACE up, restarting Tailscale..."
+    /etc/init.d/tailscale restart
+fi
 HOTPLUG
-chmod 755 "$HOOK"
+chmod 755 /etc/hotplug.d/iface/95-tailscale
+
+say '[4/6] Enabling autostart and restarting Tailscale...'
 "$INIT" enable
 "$INIT" restart
-
-say '[5/6] Waiting for the daemon (up to 30 seconds)...'
+say '[5/6] Waiting for daemon (up to 30 seconds)...'
 ready=0
 attempt=0
 while [ "$attempt" -lt 30 ]; do
@@ -193,37 +109,21 @@ while [ "$attempt" -lt 30 ]; do
     attempt=$((attempt + 1))
     sleep 1
 done
-[ "$ready" = 1 ] || die 'Daemon is unavailable; inspect logread -e tailscale.'
-# Verify that the patched command actually runs, rather than trusting init exit codes.
-verified=0
-for daemon_pid in $(pidof tailscaled); do
-    if tr '\000' '\n' < "/proc/$daemon_pid/cmdline" | grep -qx -- '--tun=userspace-networking'; then
-        verified=1
-    fi
-done
-[ "$verified" = 1 ] || die 'Daemon did not start in userspace mode.'
-COMMITTED=1
+[ "$ready" = 1 ] || die 'Daemon did not become available. Run: logread -e tailscale'
 
-say '[6/6] Configuring Tailscale network preferences...'
+say '[6/6] Connecting Tailscale (browser login, up to 5 minutes)...'
 backend=$(jsonfilter -i "$LOCK/status.json" -e '@.BackendState')
 if [ "$backend" = Running ]; then
-    # set preserves unrelated existing preferences, including advertised routes.
-    tailscale set --accept-dns=false --accept-routes=false --netfilter-mode=off
+    tailscale set --accept-dns=false --netfilter-mode=off --accept-routes=false
 else
-    say 'Open the login URL below in your browser and sign in. Waiting up to 5 minutes.'
-    if ! tailscale up --accept-dns=false --accept-routes=false --netfilter-mode=off --timeout=300s; then
-        say 'Installation is retained, but connection/authorization is NOT confirmed.' >&2
-        say 'Complete browser login/device approval, then rerun this installer.' >&2
-        say 'For diagnostics: tailscale status' >&2
+    if ! tailscale up --accept-dns=false --netfilter-mode=off --accept-routes=false --timeout=300s; then
+        say 'NOT CONNECTED: complete browser login and inspect tailscale status.' >&2
         exit 2
     fi
 fi
 tailscale status --json > "$LOCK/status.json"
 backend=$(jsonfilter -i "$LOCK/status.json" -e '@.BackendState')
-[ "$backend" = Running ] || die "Installation retained, but Tailscale is not Running: $backend"
-say 'Tailscale is Running. IPv4 address:'
+[ "$backend" = Running ] || die "Tailscale is not Running: $backend"
+say 'SUCCESS: Tailscale is Running. IPv4 address:'
 tailscale ip -4
-say "Rollback: sh $BACKUP/rollback.sh"
-say 'Before closing local access: verify SSH or LuCI from another tailnet device.'
-say 'A daemon check does not prove remote access or tailnet ACL permission.'
-say 'In the Tailscale admin console, confirm that this device has NO Ephemeral badge.'
+say 'Check SSH from another tailnet device and confirm there is no Ephemeral badge.'
