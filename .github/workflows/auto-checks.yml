@@ -1,0 +1,16 @@
+name: TS auto checks
+on:
+  push:
+    paths: ['TS_client_install_auto.sh', 'tests/test_auto.py', '.github/workflows/auto-checks.yml']
+  pull_request:
+    paths: ['TS_client_install_auto.sh', 'tests/test_auto.py', '.github/workflows/auto-checks.yml']
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh -n TS_client_install_auto.sh
+      - run: shellcheck -s sh TS_client_install_auto.sh
+      - run: python3 -m unittest discover -s tests -v
