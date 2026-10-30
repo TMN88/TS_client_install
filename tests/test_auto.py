@@ -81,7 +81,7 @@ case "$1" in add|install) touch "$TEST_ROOT/stty-installed" ;; esac
             text = text.replace('exec 3<>/dev/tty', f'exec 3>"{shell_root}/terminal" 4<"{shell_root}/input"')
             text = text.replace('read -r key <&3', 'read -r key <&4')
             if mode.startswith('install_'):
-                text = text.replace('command -v stty', f'test -f "{shell_root}/stty-installed"')
+                text = text.replace('command -v "$dependency"', f'{{ case "$dependency" in stty|timeout) test -f "{shell_root}/stty-installed" ;; *) command -v "$dependency" ;; esac; }}')
                 if mode == 'install_opkg':
                     text = text.replace('command -v apk', 'false')
             script = root / 'test.sh'
@@ -95,7 +95,7 @@ case "$1" in add|install) touch "$TEST_ROOT/stty-installed" ;; esac
             self.assertIn('КОНЕЦ', output)
             if mode in ('install_apk', 'install_opkg'):
                 action = 'add' if mode == 'install_apk' else 'install'
-                self.assertEqual((root / 'packages').read_text().splitlines(), ['update', action + ' coreutils-stty'])
+                self.assertEqual((root / 'packages').read_text().splitlines(), ['update', action + ' coreutils-stty coreutils-timeout'])
             return result.returncode, output
 
     def test_authentication(self):
