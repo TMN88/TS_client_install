@@ -44,12 +44,25 @@ printf '%s========== НАЧАЛО: Tailscale AUTO ==========%s\n' "$CYAN" "$RESE
 [ "$#" -eq 0 ] || die 'Аргументы не принимаются. Ключ вводится только в терминале.'
 [ "$(id -u)" = 0 ] || die 'Запустите от root.'
 [ -f /etc/openwrt_release ] || die 'Требуется OpenWrt.'
-for cmd in mktemp stty jsonfilter timeout awk wget sha256sum pidof; do
+for cmd in mktemp jsonfilter timeout awk wget sha256sum pidof; do
     command -v "$cmd" >/dev/null 2>&1 || die "Не найдена команда: $cmd"
 done
 mkdir /tmp/TS_client_install_auto.lock 2>/dev/null ||
     die 'Другой запуск активен или осталась блокировка /tmp/TS_client_install_auto.lock. Проверьте процессы перед её ручным удалением.'
 LOCKED=1
+if ! command -v stty >/dev/null 2>&1; then
+    say 'Установка coreutils-stty для скрытого ввода ключа...'
+    if command -v apk >/dev/null 2>&1; then
+        apk update || die 'Не удалось обновить списки apk.'
+        apk add coreutils-stty || die 'Не удалось установить coreutils-stty через apk.'
+    elif command -v opkg >/dev/null 2>&1; then
+        opkg update || die 'Не удалось обновить списки opkg.'
+        opkg install coreutils-stty || die 'Не удалось установить coreutils-stty через opkg.'
+    else
+        die 'Для установки coreutils-stty нужен apk или opkg.'
+    fi
+    command -v stty >/dev/null 2>&1 || die 'Пакет установлен, но команда stty не найдена.'
+fi
 # OpenWrt /tmp is RAM-backed. Refuse a disk-backed /tmp rather than persist a key.
 awk '$2 == "/tmp" && $3 == "tmpfs" { ok=1 } END { exit !ok }' /proc/mounts ||
     die '/tmp должен быть отдельным tmpfs (хранение ключа только в ОЗУ).'
@@ -184,4 +197,3 @@ pidof tailscaled >/dev/null 2>&1 || die 'Процесс tailscaled не найд
 [ -s /etc/tailscale/tailscaled.state ] || die 'Постоянный файл состояния не найден.'
 say 'Установка проверена. Состояние: Running. Автозапуск включён.'
 say "Tailscale IPv4: $ip"
-

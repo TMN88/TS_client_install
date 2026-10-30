@@ -63,6 +63,15 @@ esac''',
                 file = root / 'bin' / name
                 file.write_text('#!/bin/sh\n' + body + '\n')
                 file.chmod(0o755)
+            if mode.startswith('install_'):
+                manager = 'opkg' if mode == 'install_opkg' else 'apk'
+                file = root / 'bin' / manager
+                file.write_text('''#!/bin/sh
+echo "$*" >> "$TEST_ROOT/packages"
+[ "$MODE" != install_fail ] || exit 1
+case "$1" in add|install) touch "$TEST_ROOT/stty-installed" ;; esac
+''')
+                file.chmod(0o755)
             text = SOURCE.read_text(encoding='utf-8')
             text = text.replace('PATH=/usr/sbin:/usr/bin:/sbin:/bin', f'PATH="{shell_root}/bin:/usr/bin:/bin:$PATH"')
             for prefix in ('/etc/', '/tmp/', '/proc/'):
@@ -71,6 +80,10 @@ esac''',
             # Simulate the terminal only; production still uses the controlling TTY.
             text = text.replace('exec 3<>/dev/tty', f'exec 3>"{shell_root}/terminal" 4<"{shell_root}/input"')
             text = text.replace('read -r key <&3', 'read -r key <&4')
+            if mode.startswith('install_'):
+                text = text.replace('command -v stty', f'test -f "{shell_root}/stty-installed"')
+                if mode == 'install_opkg':
+                    text = text.replace('command -v apk', 'false')
             script = root / 'test.sh'
             script.write_text(text, encoding='utf-8', newline='\n')
             env = dict(os.environ, MODE=mode, TEST_ROOT=shell_root, EXPECTED_KEY=key, NO_COLOR='1')
@@ -80,6 +93,9 @@ esac''',
                 self.assertNotIn(key, output)
             self.assertFalse(list((root / 'tmp').glob('TS_client_install_auto*')), output)
             self.assertIn('КОНЕЦ', output)
+            if mode in ('install_apk', 'install_opkg'):
+                action = 'add' if mode == 'install_apk' else 'install'
+                self.assertEqual((root / 'packages').read_text().splitlines(), ['update', action + ' coreutils-stty'])
             return result.returncode, output
 
     def test_authentication(self):
@@ -100,6 +116,18 @@ esac''',
     def test_invalid_key(self):
         rc, output = self.run_case(key='invalid_key')
         self.assertNotEqual(rc, 0, output)
+
+    def test_install_missing_stty(self):
+        for mode in ('install_apk', 'install_opkg'):
+            with self.subTest(mode=mode):
+                rc, output = self.run_case(mode)
+                self.assertEqual(rc, 0, output)
+
+    def test_package_error_stops_installation(self):
+        rc, output = self.run_case('install_fail')
+        self.assertNotEqual(rc, 0, output)
+        self.assertIn('Не удалось обновить списки apk', output)
+        self.assertNotIn('Сохранение конфигурации', output)
 
 
 if __name__ == '__main__':
