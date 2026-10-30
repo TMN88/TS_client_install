@@ -4,19 +4,21 @@ set +x
 set +v
 set -eu
 umask 077
+# BusyBox ash on OpenWrt supports disabling core dumps.
+# shellcheck disable=SC3045
 ulimit -c 0 2>/dev/null || :
 unset TS_AUTHKEY TS_AUTH_KEY TS_AUTHKEY_FILE
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
-RESET= CYAN= GREEN= RED=
+RESET='' CYAN='' GREEN='' RED=''
 if [ -z "${NO_COLOR-}" ]; then
     RESET=$(printf '\033[0m'); CYAN=$(printf '\033[1;96m')
     GREEN=$(printf '\033[1;92m'); RED=$(printf '\033[1;91m')
 fi
 say() { printf '%s\n' "$*"; }
 die() { printf '%sОШИБКА: %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
-WORK= LOCKED= TTY_STATE= CHILD=
+WORK='' LOCKED='' TTY_STATE='' CHILD=''
 cleanup() {
     rc=$?
     trap - EXIT HUP INT TERM
@@ -76,8 +78,9 @@ if ! command -v tailscale >/dev/null 2>&1 || ! command -v tailscaled >/dev/null 
     chmod 755 /usr/sbin/install.sh
     /usr/sbin/install.sh --persistent-install --yes >/dev/null 2>&1 || die 'Ошибка установки TS mini.'
 fi
-command -v tailscale >/dev/null 2>&1 && command -v tailscaled >/dev/null 2>&1 ||
+if ! command -v tailscale >/dev/null 2>&1 || ! command -v tailscaled >/dev/null 2>&1; then
     die 'Установка исполняемых файлов не подтверждена.'
+fi
 tailscale version >/dev/null 2>&1 || die 'Команда tailscale version не работает.'
 [ -x /etc/init.d/tailscale ] || die 'Не найдена служба Tailscale.'
 say 'Применение настроек TS mini: userspace, SOCKS5 и hotplug WAN/WAN6...'
@@ -170,7 +173,7 @@ else
     rm -f "$WORK/key"
     [ "$auth_rc" -eq 0 ] || die 'Авторизация не завершена. Проверьте срок/права ключа, одобрение устройства, DNS, время и доступ к Tailscale. При нестандартных настройках проверьте их вручную. Затем повторите запуск.'
 fi
-state && [ "$backend" = Running ] || die 'Состояние Running не подтверждено.'
+if ! state || [ "$backend" != Running ]; then die 'Состояние Running не подтверждено.'; fi
 ip=$(timeout 5 tailscale ip -4 2>/dev/null) || die 'Не удалось получить Tailscale IPv4.'
 printf '%s\n' "$ip" | awk -F. '
     NF == 4 && $1 == 100 && $2 >= 64 && $2 <= 127 && $3 <= 255 && $4 <= 255 &&
@@ -181,3 +184,4 @@ pidof tailscaled >/dev/null 2>&1 || die 'Процесс tailscaled не найд
 [ -s /etc/tailscale/tailscaled.state ] || die 'Постоянный файл состояния не найден.'
 say 'Установка проверена. Состояние: Running. Автозапуск включён.'
 say "Tailscale IPv4: $ip"
+
