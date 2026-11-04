@@ -184,7 +184,7 @@ say '[2/6] Applying the original userspace service settings...'
 awk '
     /^[ \t]*procd_append_param command --no-logs-no-support[ \t]*$/ { next }
     /^[ \t]*procd_append_param command --tun=userspace-networking[ \t]*$/ { next }
-    /^[ \t]*procd_append_param command --socks5-server=[a-zA-Z0-9.:\[\]-]+[ \t]*$/ { next }
+    /^[ \t]*procd_append_param command --socks5-server=[^ \t]+[ \t]*$/ { next }
     /--tun|--socks5-server|--no-logs-no-support/ { bad=1 }
     { print }
     /^[ \t]*procd_append_param command --state "\$state_file"[ \t]*$/ {
