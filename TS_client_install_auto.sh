@@ -24,10 +24,10 @@ cleanup() {
     trap - EXIT HUP INT TERM
     set +e
     if [ -n "$CHILD" ]; then kill "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null; fi
-    unset key
+    unset key auth_message
     if [ -n "$TTY_STATE" ]; then stty "$TTY_STATE" <&3; fi
     if [ -n "$WORK" ]; then
-        rm -f "$WORK/key" "$WORK/status.json" "$WORK/prefs.json" "$WORK/vendor.sh" "$WORK/init.new"
+        rm -f "$WORK/status.json" "$WORK/prefs.json" "$WORK/vendor.sh" "$WORK/init.new"
         rmdir "$WORK"
     fi
     if [ -n "$LOCKED" ]; then rmdir /tmp/TS_client_install_auto.lock; fi
@@ -76,24 +76,12 @@ fi
 for dependency in stty timeout mktemp sha256sum jsonfilter; do
     command -v "$dependency" >/dev/null 2>&1 || die "После установки не найдена команда: $dependency"
 done
-# OpenWrt /tmp is RAM-backed. Refuse a disk-backed /tmp rather than persist a key.
+# Require RAM-backed temporary diagnostics; the auth key uses a pipe only.
 awk '$2 == "/tmp" && $3 == "tmpfs" { ok=1 } END { exit !ok }' /proc/mounts ||
     die '/tmp должен быть отдельным tmpfs (хранение ключа только в ОЗУ).'
 WORK=$(mktemp -d /tmp/TS_client_install_auto.XXXXXX) || die 'Не удалось создать временный каталог.'
 
-say 'Сохранение конфигурации перед установкой TS mini...'
 mkdir -p /etc/tailscale
-BACKUP=$(mktemp -d /etc/tailscale/auto-backup-XXXXXX) || die 'Ошибка резервного копирования.'
-for file in /etc/config/tailscale /etc/init.d/tailscale /etc/hotplug.d/iface/95-tailscale; do
-    if [ -f "$file" ]; then
-        case "$file" in
-            /etc/config/*) cp -p "$file" "$BACKUP/config" ;;
-            /etc/init.d/*) cp -p "$file" "$BACKUP/init" ;;
-            *) cp -p "$file" "$BACKUP/hotplug" ;;
-        esac
-    fi
-done
-say "Резервная копия: $BACKUP"
 
 if ! command -v tailscale >/dev/null 2>&1 || ! command -v tailscaled >/dev/null 2>&1; then
     say 'Установка TS mini (GuNanOvO, постоянная установка)...'
@@ -102,7 +90,20 @@ if ! command -v tailscale >/dev/null 2>&1 || ! command -v tailscaled >/dev/null 
     sh -n "$WORK/vendor.sh" || die 'Ошибка синтаксиса установщика.'
     cp "$WORK/vendor.sh" /usr/sbin/install.sh
     chmod 755 /usr/sbin/install.sh
-    /usr/sbin/install.sh --persistent-install --yes >/dev/null 2>&1 || die 'Ошибка установки TS mini.'
+    vendor_rc=0
+    /usr/sbin/install.sh --persistent-install --yes >/dev/null 2>&1 || vendor_rc=$?
+    if [ "$vendor_rc" -ne 0 ]; then
+        # A package can be installed while the vendor's default daemon start fails.
+        # Continue only when the installed payload and init are verifiably present;
+        # our userspace service and readiness checks below must still succeed.
+        if command -v tailscale >/dev/null 2>&1 &&
+           command -v tailscaled >/dev/null 2>&1 &&
+           tailscale version >/dev/null 2>&1 && [ -x /etc/init.d/tailscale ]; then
+            say 'Пакет установлен; стандартный запуск не прошёл. Проверяю запуск userspace.'
+        else
+            die 'Ошибка установки TS mini: исполняемые файлы или init не подтверждены.'
+        fi
+    fi
 fi
 if ! command -v tailscale >/dev/null 2>&1 || ! command -v tailscaled >/dev/null 2>&1; then
     die 'Установка исполняемых файлов не подтверждена.'
@@ -111,13 +112,15 @@ tailscale version >/dev/null 2>&1 || die 'Команда tailscale version не 
 [ -x /etc/init.d/tailscale ] || die 'Не найдена служба Tailscale.'
 say 'Применение настроек TS mini: userspace, SOCKS5 и hotplug WAN/WAN6...'
 awk '
+    /^[ \t]*procd_append_param env TS_FORCE_NOISE_443=true[ \t]*$/ { next }
     /^[ \t]*procd_append_param command --no-logs-no-support[ \t]*$/ { next }
     /^[ \t]*procd_append_param command --tun=userspace-networking[ \t]*$/ { next }
-    /^[ \t]*procd_append_param command --socks5-server=[a-zA-Z0-9.:\[\]-]+[ \t]*$/ { next }
+    /^[ \t]*procd_append_param command --socks5-server=[^ \t]+[ \t]*$/ { next }
     /--tun|--socks5-server|--no-logs-no-support/ { bad=1 }
     { print }
     /^[ \t]*procd_append_param command --state "\$state_file"[ \t]*$/ {
         anchors++
+        print "  procd_append_param env TS_FORCE_NOISE_443=true"
         print "  procd_append_param command --no-logs-no-support"
         print "  procd_append_param command --tun=userspace-networking"
         print "  procd_append_param command --socks5-server=0.0.0.0:1055"
@@ -173,31 +176,25 @@ if [ "$backend" = Running ]; then
 else
     # Open the controlling terminal, independently of stdin (including piped scripts).
     exec 3<>/dev/tty || die 'Нет интерактивного терминала. Запустите через SSH с TTY.'
-    TTY_STATE=$(stty -g <&3) || die 'Не удалось прочитать настройки терминала.'
-    stty echo <&3 || die 'Не удалось включить отображение ввода.'
     printf 'Введите заранее созданный auth key (ввод виден): ' >&3
     key=
     if ! IFS= read -r key <&3; then die 'Ввод ключа прерван.'; fi
-    stty "$TTY_STATE" <&3 || die 'Не удалось восстановить терминал.'
-    TTY_STATE=
     printf '\n' >&3
     case "$key" in tskey-auth-?*) ;; *) die 'Ожидается auth key с префиксом tskey-auth-.' ;; esac
     case "$key" in *[!a-zA-Z0-9_-]*) die 'Недопустимые символы в ключе.' ;; esac
-    # printf is a shell builtin: the secret never becomes a process argument.
-    printf '%s' "$key" > "$WORK/key"
-    unset key
-    say 'Авторизация на https://login.tailscale.com (до 90 секунд)...'
-    # Discard even error output: upstream diagnostics may contain sensitive data.
-    # No --reset / --force-reauth: existing non-default settings must not be erased.
-    timeout 90 tailscale up --login-server=https://login.tailscale.com \
-        --auth-key="file:$WORK/key" --accept-dns=false --netfilter-mode=off --accept-routes=false \
-        --timeout=60s >/dev/null 2>&1 &
-    CHILD=$!
+    # The secret travels through a pipe, never argv, environment or a key file.
+    say 'Авторизация: HTTPS/443, ключ через stdin, до 90 секунд...'
     auth_rc=0
-    wait "$CHILD" || auth_rc=$?
-    CHILD=
-    rm -f "$WORK/key"
-    [ "$auth_rc" -eq 0 ] || die 'Авторизация не завершена. Проверьте срок/права ключа, одобрение устройства, DNS, время и доступ к Tailscale. При нестандартных настройках проверьте их вручную. Затем повторите запуск.'
+    auth_message=$(printf '%s' "$key" | timeout -k 5 90 tailscale up \
+        --login-server=https://login.tailscale.com \
+        --auth-key=file:/dev/stdin --accept-dns=false --netfilter-mode=off \
+        --accept-routes=false --timeout=75s 2>&1) || auth_rc=$?
+    unset key
+    if [ "$auth_rc" -ne 0 ]; then
+        printf '%s\n' "$auth_message" | sed 's/tskey-auth-[[:alnum:]_-]*/[REDACTED]/g' >&2
+    fi
+    unset auth_message
+    [ "$auth_rc" -eq 0 ] || die "Вход не завершён (код $auth_rc); ключ повторно вслепую не отправляется."
 fi
 if ! state || [ "$backend" != Running ]; then die 'Состояние Running не подтверждено.'; fi
 ip=$(timeout 5 tailscale ip -4 2>/dev/null) || die 'Не удалось получить Tailscale IPv4.'
@@ -210,3 +207,4 @@ pidof tailscaled >/dev/null 2>&1 || die 'Процесс tailscaled не найд
 [ -s /etc/tailscale/tailscaled.state ] || die 'Постоянный файл состояния не найден.'
 say 'Установка проверена. Состояние: Running. Автозапуск включён.'
 say "Tailscale IPv4: $ip"
+
