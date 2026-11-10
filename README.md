@@ -111,12 +111,11 @@ sh /tmp/tailscale-rr.sh --auth-key-file /root/routerich-device.key --switch-serv
 
 ## Установка с auth key и видимым вводом
 
-Для регистрации нового роутера с заранее созданным Tailscale auth key используйте отдельный установщик. Ввод ключа отображается в SSH-терминале.
+Отдельный установщик `TS_client_install_auto.sh` повторяет проверенный сценарий `tailscale-router-quiet.sh` из навыка Tailscale_silent_install; отличие — auth key отображается при вводе в SSH-терминале. Скрипт передаёт ключ через stdin в `tailscale up`; ключ не добавляется в аргументы, переменные окружения или файл. После ввода он останется в прокрутке терминала.
 
 ```sh
-wget -O /tmp/TS_client_install_auto.sh 'https://raw.githubusercontent.com/TMN88/TS_client_install/2271156bd94a1d66992882bf6604ffb98717c1e3/TS_client_install_auto.sh' &&
+wget -O /tmp/TS_client_install_auto.sh 'https://raw.githubusercontent.com/TMN88/TS_client_install/217502f8114678b030618abe354d09e92fc3a510/TS_client_install_auto.sh' &&
 sh /tmp/TS_client_install_auto.sh
 ```
 
-Ключ не добавляйте в URL или команду. Скрипт запросит его интерактивно. Из-за видимого ввода auth key останется в прокрутке терминала.
-
+Сценарий использует HTTPS/443, постоянный state-файл и автозапуск; DNS, маршруты и netfilter Tailscale отключены. Если текущая регистрация уже `Running`, скрипт сохраняет её и не запрашивает новый ключ. Он перезапускает службу Tailscale, поэтому запускайте его через независимый SSH-доступ, а не через Tailscale именно этого роутера.
